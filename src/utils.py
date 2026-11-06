@@ -1,190 +1,266 @@
-import os
-import zipfile
-from typing import Tuple
+import json
 from pathlib import Path
-import pandas as pd
 from PIL import Image
 import torch
 from torch.utils.data import Dataset
-from sklearn.model_selection import train_test_split
 
 class WristXrayDataset(Dataset):
-    def __init__(self, csv_file, image_dir, transform=None, img_ext=".jpg"):
-        self.df = pd.read_csv(csv_file)
-        self.image_dir = Path(image_dir)
+    """GRAZPEDWRI-DX wrist X-rays from a Roboflow COCO export.
+
+    Expects a split directory containing the images and `_annotations.coco.json`
+    (e.g. data/GRAZPEDWRI-DX.v5i.coco/train).
+
+    Roboflow adds a placeholder category (supercategory "none", id 0) that no
+    annotation uses; it is dropped. The remaining category ids are remapped to
+    contiguous indices 0..C-1, listed in `self.category_names`.
+    `self.classes` / `self.num_classes` always describe what the model outputs.
+
+    task="multiclass" (single-label, for nn.CrossEntropyLoss): every image
+        gets exactly one class out of
+            classes = [negative_class, *target_classes]
+        target_classes is a priority list: an image is labelled with the first
+        target class it has a box for, otherwise negative_class. The default
+        target_classes=("fracture",) gives binary ["no_fracture", "fracture"].
+        Returns (image, one_hot) with one_hot float32 [num_classes] (so
+        `labels.argmax(1)` and `labels.shape[1]` work), or a scalar int64 class
+        index with one_hot=False.
+    task="classification" (multi-label, for nn.BCEWithLogitsLoss): returns
+        (image, multi_hot) where multi_hot is float32 [C], 1 if the image has at
+        least one box of that class.
+    task="detection": returns (image, target) where target is a torchvision
+        style dict: boxes (xyxy, float32, as tv_tensors.BoundingBoxes so
+        torchvision.transforms.v2 updates them), labels (int64, 1..C; 0 is
+        reserved for background), image_id, area, iscrowd.
+
+    `exclude_classes` drops those class names entirely (e.g. "text" for the
+    burned-in laterality markers).
+    """
+
+    ANN_FILE = "_annotations.coco.json"
+
+    TASKS = ("multiclass", "classification", "detection")
+
+    def __init__(self, split_dir, transform=None, task="multiclass",
+                 target_classes=("fracture",), negative_class=None, one_hot=True,
+                 exclude_classes=(), ann_file=None):
+        if task not in self.TASKS:
+            raise ValueError(f"task must be one of {self.TASKS}, got {task!r}")
+
+        self.image_dir = Path(split_dir)
         self.transform = transform
-        self.img_ext = img_ext
+        self.task = task
+        self.one_hot = one_hot
 
-        self.classes = self.df.columns[1:].tolist()
+        ann_path = Path(ann_file) if ann_file else self.image_dir / self.ANN_FILE
+        with open(ann_path) as f:
+            coco = json.load(f)
 
-        if "image" not in self.df.columns:
-            raise ValueError(
-                f"CSV must have an 'image' column. Found: {self.df.columns.tolist()}")
+        exclude = set(exclude_classes)
+        used_cat_ids = {a["category_id"] for a in coco["annotations"]}
+        cats = sorted(
+            (c for c in coco["categories"]
+             if not (c.get("supercategory") == "none" and c["id"] not in used_cat_ids)
+             and c["name"] not in exclude),
+            key=lambda c: c["id"],
+        )
+        self.category_names = [c["name"] for c in cats]
+        self.cat_id_to_idx = {c["id"]: i for i, c in enumerate(cats)}
 
-        self.label_columns = [c for c in self.df.columns if c != "image"]
+        if task == "multiclass":
+            target_classes = list(target_classes)
+            missing = [c for c in target_classes if c not in self.category_names]
+            if missing:
+                raise ValueError(f"target_classes {missing} not in {self.category_names}")
+            if not target_classes or len(set(target_classes)) != len(target_classes):
+                raise ValueError("target_classes must be a non-empty list without duplicates")
+            if negative_class is None:
+                negative_class = (f"no_{target_classes[0]}" if len(target_classes) == 1
+                                  else "other")
+            self.classes = [negative_class, *target_classes]
+            # category index -> output class, highest priority first
+            self._priority = [(self.category_names.index(c), i + 1)
+                              for i, c in enumerate(target_classes)]
+        else:
+            self.classes = list(self.category_names)
 
-        if self.img_ext is None:
-            self._path_cache = {
-                img_id: self._resolve_path(img_id)
-                for img_id in self.df["image"]
-            }
+        self.images = sorted(coco["images"], key=lambda im: im["id"])
+        self.anns_by_image = {im["id"]: [] for im in self.images}
+        for a in coco["annotations"]:
+            if a["category_id"] in self.cat_id_to_idx and a["image_id"] in self.anns_by_image:
+                self.anns_by_image[a["image_id"]].append(a)
 
-    def _resolve_path(self, image_id):
-        for ext in (".jpg", ".png", ".jpeg"):
-            path = self.image_dir / (image_id + ext)
-            if path.exists():
-                return path
-        raise FileNotFoundError(f"No image found for ID: {image_id}")
-
-    def _get_image_path(self, image_id):
-        if self.img_ext is not None:
-            return self.image_dir / (image_id + self.img_ext)
-        return self._path_cache[image_id]
+    @property
+    def num_classes(self):
+        return len(self.classes)
 
     def __len__(self):
-        return len(self.df)
+        return len(self.images)
+
+    def _load_image(self, info):
+        with Image.open(self.image_dir / info["file_name"]) as img:
+            return img.convert("RGB")
+
+    def _multi_hot(self, anns):
+        label = torch.zeros(len(self.category_names), dtype=torch.float32)
+        for a in anns:
+            label[self.cat_id_to_idx[a["category_id"]]] = 1.0
+        return label
+
+    def _class_index(self, anns):
+        present = {self.cat_id_to_idx[a["category_id"]] for a in anns}
+        for cat_idx, out_idx in self._priority:
+            if cat_idx in present:
+                return out_idx
+        return 0
+
+    def _single_label(self, anns):
+        idx = self._class_index(anns)
+        if not self.one_hot:
+            return torch.tensor(idx, dtype=torch.int64)
+        label = torch.zeros(len(self.classes), dtype=torch.float32)
+        label[idx] = 1.0
+        return label
+
+    @property
+    def targets(self):
+        """Class index per image (multiclass only), e.g. for class weights or
+        a WeightedRandomSampler, without decoding any images."""
+        if self.task != "multiclass":
+            raise AttributeError("targets is only defined for task='multiclass'")
+        return [self._class_index(self.anns_by_image[im["id"]]) for im in self.images]
+
+    def _detection_target(self, info, anns, image_size):
+        from torchvision import tv_tensors
+
+        boxes, labels, areas, iscrowd = [], [], [], []
+        for a in anns:
+            x, y, w, h = a["bbox"]
+            if w <= 0 or h <= 0:
+                continue
+            boxes.append([x, y, x + w, y + h])
+            labels.append(self.cat_id_to_idx[a["category_id"]] + 1)
+            areas.append(a.get("area", w * h))
+            iscrowd.append(a.get("iscrowd", 0))
+
+        h, w = image_size
+        return {
+            "boxes": tv_tensors.BoundingBoxes(
+                torch.tensor(boxes, dtype=torch.float32).reshape(-1, 4),
+                format="XYXY", canvas_size=(h, w)),
+            "labels": torch.tensor(labels, dtype=torch.int64),
+            "image_id": info["id"],
+            "area": torch.tensor(areas, dtype=torch.float32),
+            "iscrowd": torch.tensor(iscrowd, dtype=torch.int64),
+        }
 
     def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        image_id = row["image"]
+        info = self.images[idx]
+        anns = self.anns_by_image[info["id"]]
+        image = self._load_image(info)
 
-        with Image.open(self._get_image_path(image_id)) as img:
-            image = img.convert("RGB")
+        if self.task != "detection":
             if self.transform:
                 image = self.transform(image)
+            label = self._single_label(anns) if self.task == "multiclass" else self._multi_hot(anns)
+            return image, label
 
-        label = torch.from_numpy(
-            row[self.label_columns].to_numpy(dtype="float32")
-        )
+        target = self._detection_target(info, anns, (image.height, image.width))
+        if self.transform:
+            image, target = self.transform(image, target)
+        return image, target
 
-        return image, label
-
-class Spliter():
-    LABEL_COLS = ["MEL", "NV", "BCC", "AK", "BKL", "DF", "VASC", "SCC", "UNK"]
-
-
-    def extract_archive_if_needed(self):
-        base_dir = Path("src/dataset")
-        archive_dir = base_dir / "archive"
-        zip_file = base_dir / "archive.zip"
-
-        if archive_dir.is_dir():
-            if any(archive_dir.iterdir()):
-                if zip_file.is_file():
-                    zip_file.unlink()
-                    print(
-                        "The 'archive' subdirectory already exists. 'archive.zip' deleted.")
-                else:
-                    print("The 'archive' subdirectory already exists.")
-                return
-            else:
-                print(
-                    "The 'archive' directory exists but is empty. Proceeding with extraction...")
-
-        if zip_file.is_file():
-            try:
-                print("Extracting 'archive.zip'...")
-
-                archive_dir.mkdir(parents=True, exist_ok=True)
-
-                with zipfile.ZipFile(zip_file, 'r') as zip_ref:
-                    for member in zip_ref.infolist():
-                        member_path = Path(member.filename)
-                        if member_path.parts and member_path.parts[0] == "archive":
-                            relative_path = Path(*member_path.parts[1:])
-                        else:
-                            relative_path = member_path
-
-                        target_path = archive_dir / relative_path
-
-                        if member.is_dir():
-                            target_path.mkdir(parents=True, exist_ok=True)
-                        else:
-                            target_path.parent.mkdir(parents=True, exist_ok=True)
-                            with zip_ref.open(member) as source, open(target_path, "wb") as target:
-                                target.write(source.read())
-
-                print("Extraction complete.")
-                zip_file.unlink()
-                print("'archive.zip' has been deleted.")
-
-            except (zipfile.BadZipFile, PermissionError) as e:
-                print(f"Extraction failed: {e}")
-                print("'archive.zip' was not deleted.")
-        else:
-            print("Neither the 'archive' folder nor 'archive.zip' was found.")
+    @staticmethod
+    def detection_collate(batch):
+        """collate_fn for detection DataLoaders (variable number of boxes)."""
+        return tuple(zip(*batch))
 
 
-    def drop_zero_variance_numeric(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Drops only numeric columns with a mathematical variance of exactly 0."""
-
-        numeric_df = df.select_dtypes(include='number')
-
-        zero_var_cols = numeric_df.columns[numeric_df.var() == 0]
-
-        return df.drop(columns=zero_var_cols)
+DATA_ROOT = Path(__file__).resolve().parent.parent / "data" / "GRAZPEDWRI-DX.v5i.coco"
+SPLITS = ("train", "valid", "test")
 
 
-    def load_ground_truth(self, gt_path: Path) -> pd.DataFrame:
-        df = pd.read_csv(gt_path)
-        df["label"] = df[self.LABEL_COLS].idxmax(axis=1)
-        df = self.drop_zero_variance_numeric(df)
-        return df
+def main(data_root=DATA_ROOT, batch_size=32, num_workers=0, max_batches=None):
+    """Smoke test: build every split in both modes and iterate a DataLoader."""
+    import time
+    from torch.utils.data import DataLoader
+    from torchvision.transforms import v2
+
+    cls_tf = v2.Compose([
+        v2.ToImage(),
+        v2.Resize((224, 224)),
+        v2.ToDtype(torch.float32, scale=True),
+    ])
+    det_tf = v2.Compose([
+        v2.ToImage(),
+        v2.RandomHorizontalFlip(),
+        v2.ToDtype(torch.float32, scale=True),
+    ])
+
+    for split in SPLITS:
+        split_dir = Path(data_root) / split
+        print(f"\n=== {split} ({split_dir}) ===")
+
+        # Image-level labels, default collate.
+        # multiclass: one-hot, exactly one class per image (CrossEntropyLoss).
+        # classification: multi-hot over all categories (BCEWithLogitsLoss).
+        for task in ("multiclass", "classification"):
+            ds = WristXrayDataset(split_dir, task=task, transform=cls_tf)
+            loader = DataLoader(ds, batch_size=batch_size, shuffle=(split == "train"),
+                                num_workers=num_workers)
+            counts = torch.zeros(ds.num_classes)
+            n_imgs, t0 = 0, time.time()
+            for i, (images, labels) in enumerate(loader):
+                assert images.shape[1:] == (3, 224, 224), images.shape
+                assert labels.shape == (images.shape[0], ds.num_classes), labels.shape
+                if task == "multiclass":
+                    assert (labels.sum(1) == 1).all(), "multiclass label must be one-hot"
+                counts += labels.sum(0)
+                n_imgs += images.shape[0]
+                if max_batches and i + 1 >= max_batches:
+                    break
+            print(f"[{task:<14s}] {n_imgs}/{len(ds)} images in {time.time() - t0:.1f}s, "
+                  f"last batch {tuple(images.shape)}")
+            print("  images per class:",
+                  {c: int(n) for c, n in zip(ds.classes, counts)})
+
+        # Detection: variable number of boxes per image, custom collate.
+        ds = WristXrayDataset(split_dir, task="detection", exclude_classes=["text"],
+                              transform=det_tf)
+        loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
+                            num_workers=num_workers,
+                            collate_fn=WristXrayDataset.detection_collate)
+        n_imgs = n_boxes = n_empty = 0
+        t0 = time.time()
+        for i, (images, targets) in enumerate(loader):
+            for img, tgt in zip(images, targets):
+                boxes = tgt["boxes"]
+                assert boxes.ndim == 2 and boxes.shape[1] == 4
+                assert len(boxes) == len(tgt["labels"])
+                if len(boxes):
+                    h, w = img.shape[-2:]
+                    assert (boxes[:, 2] > boxes[:, 0]).all() and (boxes[:, 3] > boxes[:, 1]).all()
+                    assert boxes.min() >= 0 and (boxes[:, [0, 2]] <= w).all() and (boxes[:, [1, 3]] <= h).all()
+                    assert tgt["labels"].min() >= 1 and tgt["labels"].max() <= ds.num_classes
+                n_boxes += len(boxes)
+                n_empty += len(boxes) == 0
+            n_imgs += len(images)
+            if max_batches and i + 1 >= max_batches:
+                break
+        print(f"[detection]      {n_imgs}/{len(ds)} images in {time.time() - t0:.1f}s, "
+              f"{n_boxes} boxes, {n_empty} images without boxes (text excluded)")
+
+    print("\nAll splits loaded OK.")
 
 
-    def stratified_split(
-        self,
-        df: pd.DataFrame,
-        train_size: float = 0.7,
-        val_size: float = 0.2,
-        test_size: float = 0.1,
-        seed: int = 42,
-    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        assert abs(train_size + val_size + test_size - 1.0) < 1e-6
+if __name__ == "__main__":
+    import argparse
 
-        rare_mask = df["label"].isin(
-            df["label"].value_counts()[lambda x: x < 4].index
-        )
-        rare_df = df[rare_mask]
-        main_df = df[~rare_mask]
-
-        train_df, temp_df = train_test_split(
-            main_df, test_size=(1 - train_size),
-            stratify=main_df["label"], random_state=seed,
-        )
-        val_ratio_adjusted = val_size / (val_size + test_size)
-        val_df, test_df = train_test_split(
-            temp_df, test_size=(1 - val_ratio_adjusted),
-            stratify=temp_df["label"], random_state=seed,
-        )
-
-        for _, group in rare_df.groupby("label"):
-            rows = group.sample(frac=1, random_state=seed).reset_index(drop=True)
-            splits = [train_df, val_df, test_df]
-            for i, (_, row) in enumerate(rows.iterrows()):
-                splits[i % 3] = pd.concat([splits[i % 3], row.to_frame().T])
-            train_df, val_df, test_df = splits
-
-        def check_dist(df, name):
-            print(f"\n{name}")
-            print(df["label"].value_counts(normalize=True))
-
-        check_dist(train_df, "Train")
-        check_dist(val_df, "Val")
-        check_dist(test_df, "Test")
-
-        return train_df.drop(columns=['label']), val_df.drop(columns=['label']), test_df.drop(columns=['label'])
-
-
-    def save_splits(
-            self,
-        train_df: pd.DataFrame,
-        val_df: pd.DataFrame,
-        test_df: pd.DataFrame,
-        out_dir: Path,
-    ) -> None:
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        train_df.to_csv(out_dir / "train.csv", index=False)
-        val_df.to_csv(out_dir / "val.csv", index=False)
-        test_df.to_csv(out_dir / "test.csv", index=False)
+    p = argparse.ArgumentParser(description="Smoke-test WristXrayDataset on all splits.")
+    p.add_argument("--data-root", type=Path, default=DATA_ROOT)
+    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--num-workers", type=int, default=0,
+                   help="worker processes (startup is slow on macOS spawn; 0 is fastest here)")
+    p.add_argument("--max-batches", type=int, default=None,
+                   help="stop each loader after N batches (default: full pass)")
+    a = p.parse_args()
+    main(a.data_root, a.batch_size, a.num_workers, a.max_batches)
